@@ -173,6 +173,9 @@ async def download_stream(
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
         "merge_output_format": "mp4",
         "windowsfilenames": True,
+        "continuedl": True,
+        "nopart": False,
+        "overwrites": False,
         "max_filesize": MAX_FILE_SIZE_BYTES,
     }
 

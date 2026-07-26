@@ -28,13 +28,12 @@ Repo → **Settings → Secrets and variables → Actions**:
 1. Push to `main` or open **Actions → Telegram Downloader Bot → Run workflow**
 2. Message the bot on Telegram (`/start`)
 
-## Local / VPS (optional)
+## Persistence across Action restarts
 
-```bash
-cp .env.example .env   # fill tokens
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python bot.py
-# or 24/7 on a VPS:
-./run_server.sh
-```
+Partial downloads are kept so the next job can **resume**:
+
+1. **Actions cache** — full `temp/` including large files (up to cache limits)
+2. **`bot-data` git branch** — files under ~90MB (GitHub file size limit)
+3. Torrents use a **stable session folder**; streams use yt-dlp `continuedl`
+
+Do not commit media into `main` (public + size limits).

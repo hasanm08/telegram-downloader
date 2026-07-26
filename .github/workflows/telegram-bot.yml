@@ -1,11 +1,9 @@
 name: Telegram Downloader Bot
 
-# GitHub Actions is not a real VPS: each job max ~6 hours.
-# This workflow keeps the bot alive by restarting on a schedule.
+# GitHub Actions job max ~6 hours. Persist temp/ across restarts so downloads resume.
 on:
   workflow_dispatch:
   schedule:
-    # Restart before the 6h job limit (overlap cancelled via concurrency)
     - cron: "0 */5 * * *"
   push:
     branches: [main]
@@ -19,11 +17,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      contents: read
+      contents: write   # push bot-data branch with small resumable files
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore temp cache (large partial downloads)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            temp
+          key: bot-temp-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bot-temp-
+
+      - name: Restore temp from bot-data branch
+        run: |
+          chmod +x scripts/restore_workdir.sh
+          ./scripts/restore_workdir.sh
 
       - name: Install system deps
         run: |
@@ -68,7 +82,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
           if [ -z "${TELEGRAM_API_ID}" ] || [ -z "${TELEGRAM_API_HASH}" ]; then
-            echo "Skipping local Bot API (TELEGRAM_API_ID / HASH secrets not set) — 50 MB upload limit"
+            echo "Skipping local Bot API — 50 MB upload limit"
             exit 0
           fi
           docker pull aiogram/telegram-bot-api:latest
@@ -92,14 +106,48 @@ jobs:
             sleep 2
           done
           if [ "$ok" != "1" ]; then
-            echo "Local Bot API did not become ready; continuing with official API (50 MB upload limit)"
+            echo "Local Bot API not ready — using official API (50 MB)"
             docker logs telegram-bot-api || true
             exit 0
           fi
           sed -i 's|^TELEGRAM_API_BASE_URL=.*|TELEGRAM_API_BASE_URL=http://127.0.0.1:8081|' .env
           echo "Local Bot API enabled for up to 2 GB uploads"
 
-      - name: Run bot
+      - name: Run bot (periodic persist in background)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          echo "Starting bot (job will run until cancelled/timeout ~5h50m, then schedule restarts it)"
+          chmod +x scripts/persist_workdir.sh
+          # Persist every 15 minutes so a sudden cancel still keeps most progress
+          (
+            while true; do
+              sleep 900
+              ./scripts/persist_workdir.sh || true
+            done
+          ) &
+          echo $! > /tmp/persist.pid
+          echo "Starting bot (resumable temp/ + cache + bot-data branch)"
+          set +e
           python bot.py
+          code=$?
+          set -e
+          kill "$(cat /tmp/persist.pid)" 2>/dev/null || true
+          exit "$code"
+
+      - name: Persist temp to bot-data branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          chmod +x scripts/persist_workdir.sh
+          ./scripts/persist_workdir.sh || true
+
+      - name: Save temp cache (includes large partials up to ~2GB)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            temp
+          key: bot-temp-${{ github.run_id }}-${{ github.run_attempt }}

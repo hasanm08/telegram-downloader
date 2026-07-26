@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import shutil
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -38,13 +38,18 @@ def _fmt_size(n: int) -> str:
     return f"{x:.1f} TB"
 
 
+def _session_key(torrent_path: Optional[Path], magnet: Optional[str]) -> str:
+    """Stable id so Action restarts resume the same aria2 session directory."""
+    if magnet:
+        raw = magnet.strip().encode()
+    else:
+        assert torrent_path is not None
+        raw = torrent_path.read_bytes()
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
 def _pick_output(session_dir: Path) -> Path:
-    """
-    Prefer a single file. If the torrent is a folder with many files,
-    zip is not used — pick the largest file under the size limit.
-    """
     files = [p for p in session_dir.rglob("*") if p.is_file()]
-    # Ignore aria2 control files
     files = [p for p in files if not p.name.endswith(".aria2") and p.suffix != ".torrent"]
     if not files:
         raise RuntimeError("Torrent finished but no files were found.")
@@ -67,13 +72,12 @@ async def download_torrent(
     on_progress: Optional[ProgressCallback] = None,
 ) -> TorrentResult:
     if not aria2_available():
-        raise RuntimeError(
-            "aria2c is not installed. Run: brew install aria2"
-        )
+        raise RuntimeError("aria2c is not installed. Run: brew install aria2")
     if not torrent_path and not magnet:
         raise ValueError("Provide a .torrent file or a magnet link.")
 
-    session_dir = TEMP_DIR / f"torrent_{uuid.uuid4().hex[:12]}"
+    key = _session_key(torrent_path, magnet)
+    session_dir = TEMP_DIR / f"torrent_{key}"
     session_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -85,22 +89,26 @@ async def download_torrent(
         "--bt-max-peers=64",
         "--file-allocation=none",
         "--continue=true",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
         "--max-connection-per-server=16",
         "--split=16",
         "--min-split-size=1M",
         "--summary-interval=5",
         "--console-log-level=notice",
-        f"--max-download-limit=0",
-        # Stop if total download would exceed limit (approx)
-        f"--bt-max-open-files=100",
+        "--max-download-limit=0",
+        "--bt-max-open-files=100",
     ]
 
     if torrent_path:
         if not torrent_path.exists():
             raise FileNotFoundError(f"Torrent file not found: {torrent_path}")
-        # Copy into session so caller can safely delete the original
         local_torrent = session_dir / "input.torrent"
-        shutil.copy2(torrent_path, local_torrent)
+        if (
+            not local_torrent.exists()
+            or local_torrent.stat().st_size != torrent_path.stat().st_size
+        ):
+            shutil.copy2(torrent_path, local_torrent)
         cmd.append(str(local_torrent))
         label = torrent_path.name
     else:
@@ -108,11 +116,11 @@ async def download_torrent(
         label = "magnet"
 
     if on_progress:
-        await on_progress(f"🧲 Starting torrent download…\n`{label}`")
+        await on_progress(f"🧲 Starting torrent (resumable)…\n{label}")
 
     loop = asyncio.get_running_loop()
 
-    def _run() -> tuple[int, str, str]:
+    def _run() -> tuple[int, str]:
         import subprocess
 
         proc = subprocess.Popen(
@@ -128,19 +136,17 @@ async def download_torrent(
         for line in proc.stdout:
             line = line.rstrip()
             lines.append(line)
-            # aria2 progress lines often contain "Download Progress Summary" or "#"
             if "%" in line and ("DL:" in line or "ETA:" in line or "[" in line):
-                # Example: [#2c3d4e 12MiB/100MiB(12%) CN:4 SD:0 DL:1.2MiB ETA:1m]
                 if line != last_pct and on_progress:
                     last_pct = line
                     msg = f"🧲 {_short_progress(line)}"
                     asyncio.run_coroutine_threadsafe(on_progress(msg), loop)
         code = proc.wait()
-        return code, "\n".join(lines[-40:]), "\n".join(lines)
+        return code, "\n".join(lines[-40:])
 
-    code, tail, _full = await loop.run_in_executor(None, _run)
+    code, tail = await loop.run_in_executor(None, _run)
     if code != 0:
-        shutil.rmtree(session_dir, ignore_errors=True)
+        # Keep session_dir so the next Action run can resume
         raise RuntimeError(f"aria2c failed (exit {code}):\n{tail[:800]}")
 
     chosen = _pick_output(session_dir)
@@ -161,7 +167,6 @@ async def download_torrent(
 
 
 def _short_progress(line: str) -> str:
-    # Keep Telegram status messages short
     text = line.strip()
     if len(text) > 180:
         text = text[:177] + "…"
