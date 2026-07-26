@@ -81,63 +81,99 @@ def cleanup(path: Path) -> None:
         logger.warning("Failed to delete %s: %s", path, exc)
 
 
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+
+def _http_headers(url: str, referer: Optional[str] = None) -> dict:
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else ""
+    ref = referer or origin or url
+    return {
+        "User-Agent": BROWSER_UA,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": ref,
+        "Origin": origin or ref,
+        "Connection": "keep-alive",
+    }
+
+
+def _friendly_http_error(exc: BaseException, url: str) -> str:
+    text = str(exc)
+    if "403" in text or "Forbidden" in text:
+        return (
+            "HTTP 403 Forbidden — the site/CDN blocked this server IP "
+            "(common on GitHub Actions). Try again later, use a smaller/"
+            "different host, or run the bot on a residential VPS.\n"
+            f"URL: {url[:200]}"
+        )
+    if "401" in text or "Unauthorized" in text:
+        return f"HTTP 401 Unauthorized — login/cookies may be required.\nURL: {url[:200]}"
+    return text
+
+
 async def download_direct(
     url: str,
     on_progress: Optional[ProgressCallback] = None,
+    referer: Optional[str] = None,
 ) -> DownloadResult:
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=120)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-    }
+    headers = _http_headers(url, referer=referer)
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(url, allow_redirects=True) as resp:
-            resp.raise_for_status()
-            total = int(resp.headers.get("Content-Length") or 0)
-            if total and total > MAX_FILE_SIZE_BYTES:
-                raise ValueError(
-                    f"File is too large ({_fmt_size(total)}). "
-                    f"Limit is {_fmt_size(MAX_FILE_SIZE_BYTES)}."
+        try:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status == 403:
+                    raise PermissionError(_friendly_http_error(Exception("403"), url))
+                resp.raise_for_status()
+                total = int(resp.headers.get("Content-Length") or 0)
+                if total and total > MAX_FILE_SIZE_BYTES:
+                    raise ValueError(
+                        f"File is too large ({_fmt_size(total)}). "
+                        f"Limit is {_fmt_size(MAX_FILE_SIZE_BYTES)}."
+                    )
+
+                cd = resp.headers.get("Content-Disposition", "")
+                filename = _filename_from_cd(cd)
+                if not filename:
+                    path_name = Path(unquote(urlparse(str(resp.url)).path)).name
+                    filename = path_name if path_name and "." in path_name else "download.bin"
+                if "." not in filename:
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                    filename = f"{filename}{mimetypes.guess_extension(ctype) or '.bin'}"
+
+                filename = _safe_filename(filename)
+                out_path = _unique_path(TEMP_DIR / filename)
+                downloaded = 0
+                last_report = 0
+                async with aiofiles.open(out_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 256):
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded > MAX_FILE_SIZE_BYTES:
+                            out_path.unlink(missing_ok=True)
+                            raise ValueError(
+                                f"Download exceeded size limit ({_fmt_size(MAX_FILE_SIZE_BYTES)})."
+                            )
+                        if on_progress and total and downloaded - last_report >= total * 0.1:
+                            pct = int(downloaded * 100 / total)
+                            await on_progress(
+                                f"⬇️ Server download… {pct}% "
+                                f"({_fmt_size(downloaded)} / {_fmt_size(total)})"
+                            )
+                            last_report = downloaded
+
+                return DownloadResult(
+                    path=out_path,
+                    title=out_path.stem,
+                    source="direct",
+                    size=out_path.stat().st_size,
                 )
-
-            cd = resp.headers.get("Content-Disposition", "")
-            filename = _filename_from_cd(cd)
-            if not filename:
-                path_name = Path(unquote(urlparse(str(resp.url)).path)).name
-                filename = path_name if path_name and "." in path_name else "download.bin"
-            if "." not in filename:
-                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-                filename = f"{filename}{mimetypes.guess_extension(ctype) or '.bin'}"
-
-            filename = _safe_filename(filename)
-            out_path = _unique_path(TEMP_DIR / filename)
-            downloaded = 0
-            last_report = 0
-            async with aiofiles.open(out_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 256):
-                    await f.write(chunk)
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE_BYTES:
-                        out_path.unlink(missing_ok=True)
-                        raise ValueError(
-                            f"Download exceeded size limit ({_fmt_size(MAX_FILE_SIZE_BYTES)})."
-                        )
-                    if on_progress and total and downloaded - last_report >= total * 0.1:
-                        pct = int(downloaded * 100 / total)
-                        await on_progress(
-                            f"⬇️ Server download… {pct}% "
-                            f"({_fmt_size(downloaded)} / {_fmt_size(total)})"
-                        )
-                        last_report = downloaded
-
-            return DownloadResult(
-                path=out_path,
-                title=out_path.stem,
-                source="direct",
-                size=out_path.stat().st_size,
-            )
+        except aiohttp.ClientResponseError as exc:
+            raise PermissionError(_friendly_http_error(exc, url)) from exc
 
 
 async def download_stream(
@@ -166,8 +202,8 @@ async def download_stream(
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 3,
-        "fragment_retries": 3,
+        "retries": 5,
+        "fragment_retries": 5,
         "concurrent_fragment_downloads": 4,
         "progress_hooks": [hook],
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -176,40 +212,45 @@ async def download_stream(
         "continuedl": True,
         "nopart": False,
         "overwrites": False,
+        "geo_bypass": True,
+        "http_headers": _http_headers(url, referer=url),
         "max_filesize": MAX_FILE_SIZE_BYTES,
     }
 
     def _run() -> DownloadResult:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                raise RuntimeError("Could not extract media info from this URL.")
-            if "entries" in info:
-                entries = [e for e in info["entries"] if e]
-                if not entries:
-                    raise RuntimeError("No media found in playlist/URL.")
-                info = entries[0]
-            filepath = Path(ydl.prepare_filename(info))
-            if not filepath.exists():
-                for candidate in filepath.parent.glob(f"{filepath.stem}.*"):
-                    if candidate.is_file() and candidate.suffix not in {".part", ".ytdl"}:
-                        filepath = candidate
-                        break
-            if not filepath.exists():
-                raise RuntimeError("Download finished but file was not found.")
-            size = filepath.stat().st_size
-            if size > MAX_FILE_SIZE_BYTES:
-                filepath.unlink(missing_ok=True)
-                raise ValueError(
-                    f"File is too large ({_fmt_size(size)}). "
-                    f"Limit is {_fmt_size(MAX_FILE_SIZE_BYTES)}."
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info is None:
+                    raise RuntimeError("Could not extract media info from this URL.")
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    if not entries:
+                        raise RuntimeError("No media found in playlist/URL.")
+                    info = entries[0]
+                filepath = Path(ydl.prepare_filename(info))
+                if not filepath.exists():
+                    for candidate in filepath.parent.glob(f"{filepath.stem}.*"):
+                        if candidate.is_file() and candidate.suffix not in {".part", ".ytdl"}:
+                            filepath = candidate
+                            break
+                if not filepath.exists():
+                    raise RuntimeError("Download finished but file was not found.")
+                size = filepath.stat().st_size
+                if size > MAX_FILE_SIZE_BYTES:
+                    filepath.unlink(missing_ok=True)
+                    raise ValueError(
+                        f"File is too large ({_fmt_size(size)}). "
+                        f"Limit is {_fmt_size(MAX_FILE_SIZE_BYTES)}."
+                    )
+                return DownloadResult(
+                    path=filepath,
+                    title=info.get("title") or filepath.stem,
+                    source="stream",
+                    size=size,
                 )
-            return DownloadResult(
-                path=filepath,
-                title=info.get("title") or filepath.stem,
-                source="stream",
-                size=size,
-            )
+        except yt_dlp.utils.DownloadError as exc:
+            raise RuntimeError(_friendly_http_error(exc, url)) from exc
 
     return await loop.run_in_executor(None, _run)
 
@@ -223,17 +264,27 @@ async def download_url(
     if force_direct or is_probably_direct_file(url):
         if on_progress:
             await on_progress("⬇️ Server downloading file…")
-        return await download_direct(url, on_progress)
+        try:
+            return await download_direct(url, on_progress, referer=url)
+        except Exception as exc:
+            raise RuntimeError(_friendly_http_error(exc, url)) from exc
 
     try:
         if on_progress:
             await on_progress("🔍 Server resolving stream…")
         return await download_stream(url, on_progress)
-    except yt_dlp.utils.DownloadError as exc:
-        logger.info("yt-dlp failed (%s); trying direct", exc)
+    except Exception as exc:
+        logger.info("stream download failed (%s); trying direct", exc)
         if on_progress:
-            await on_progress("⬇️ Stream unsupported — direct download on server…")
-        return await download_direct(url, on_progress)
+            await on_progress("⬇️ Stream failed — trying direct download…")
+        try:
+            return await download_direct(url, on_progress, referer=url)
+        except Exception as exc2:
+            # Prefer the clearer 403 message if present
+            msg = _friendly_http_error(exc2, url)
+            if "403" not in msg:
+                msg = f"{_friendly_http_error(exc, url)}\nAlso: {msg}"
+            raise RuntimeError(msg) from exc2
 
 
 def _filename_from_cd(header: str) -> Optional[str]:

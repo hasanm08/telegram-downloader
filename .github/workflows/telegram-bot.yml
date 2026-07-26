@@ -17,13 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     permissions:
-      contents: write   # push bot-data branch with small resumable files
+      contents: write   # push bot-data branch
+      actions: write    # save/restore cache
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Restore temp cache (large partial downloads)
         uses: actions/cache/restore@v4
@@ -113,13 +116,21 @@ jobs:
           sed -i 's|^TELEGRAM_API_BASE_URL=.*|TELEGRAM_API_BASE_URL=http://127.0.0.1:8081|' .env
           echo "Local Bot API enabled for up to 2 GB uploads"
 
+      - name: Ensure Actions can write to repo
+        env:
+          GH_TOKEN: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # Fail early with a clear message if token cannot push (repo set to read-only workflows)
+          if ! gh api "repos/${{ github.repository }}" --jq .permissions.push | grep -q true; then
+            echo "::warning::Token may lack push access. Set repo Settings→Actions→General→Workflow permissions to 'Read and write', or add secret REPO_PAT (classic PAT with repo scope)."
+          fi
+
       - name: Run bot (periodic persist in background)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           chmod +x scripts/persist_workdir.sh
-          # Persist every 15 minutes so a sudden cancel still keeps most progress
           (
             while true; do
               sleep 900
@@ -138,7 +149,7 @@ jobs:
       - name: Persist temp to bot-data branch
         if: always()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           chmod +x scripts/persist_workdir.sh

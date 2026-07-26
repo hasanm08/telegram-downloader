@@ -48,7 +48,13 @@ else
   git commit -qm "chore: persist temp workdir $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   if [[ -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_TOKEN:-}" ]]; then
     git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-    git push -f origin bot-data
+    if ! git push -f origin bot-data 2>push.err; then
+      echo "WARN: git push bot-data failed (often HTTP 403 if Actions token is read-only):"
+      cat push.err || true
+      echo "Fix: Repo Settings → Actions → General → Workflow permissions → Read and write permissions"
+      echo "Or add secret REPO_PAT (PAT with 'repo' scope)."
+      exit 0
+    fi
     echo "Pushed origin/bot-data"
   else
     echo "Skip push (no GITHUB_TOKEN/REPOSITORY)"
