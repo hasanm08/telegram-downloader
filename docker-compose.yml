@@ -1,0 +1,42 @@
+# 24/7 downloader stack — run on a VPS so it works while your Mac/phone is offline.
+# Needs TELEGRAM_API_ID + TELEGRAM_API_HASH in .env for 2 GB uploads.
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    command:
+      - --api-id=${TELEGRAM_API_ID}
+      - --api-hash=${TELEGRAM_API_HASH}
+      - --local
+      - --http-port=8081
+      - --dir=/var/lib/telegram-bot-api
+    volumes:
+      - bot_api_data:/var/lib/telegram-bot-api
+    ports:
+      - "8081:8081"
+    # Bot and API share a network so bot can use http://telegram-bot-api:8081
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+    env_file:
+      - .env
+    environment:
+      TELEGRAM_API_BASE_URL: http://telegram-bot-api:8081
+      MAX_FILE_SIZE_MB: "2000"
+      MAX_CONCURRENT_DOWNLOADS: "10"
+      DOWNLOAD_DIR: /app/temp
+    volumes:
+      - bot_temp:/app/temp
+    # Allow local Bot API to read files via file:// absolute paths in the bot container.
+    # Shared temp volume path must match inside both containers for file:// sends.
+    # Simpler approach: bot uploads multipart to local API (works across containers).
+
+volumes:
+  bot_api_data:
+  bot_temp:
