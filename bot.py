@@ -70,9 +70,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     aria = "ok" if aria2_available() else "MISSING (install aria2)"
     local = (
         f"ON — uploads up to {MAX_FILE_SIZE_MB} MB as one file"
-        if LOCAL_MODE
-        else "OFF — files over 50 MB are split into parts"
+        if LOCAL_MODE        else "OFF — videos over 50 MB are split into timed clips"
     )
+
     active, waiting, maximum = await queue_stats()
     await update.message.reply_text(
         "Downloader Bot (24/7 server mode)\n\n"
@@ -434,9 +434,14 @@ async def _deliver_file(
     chunk_limit = max(1_000_000, TELEGRAM_UPLOAD_LIMIT - (2 * 1024 * 1024))
 
     if size > TELEGRAM_UPLOAD_LIMIT:
+        is_video = path.suffix.lower() in VIDEO_EXTS
         await on_progress(
-            f"📦 {_fmt(size)} over {_fmt(TELEGRAM_UPLOAD_LIMIT)} limit — "
-            f"splitting into ~{_fmt(chunk_limit)} parts…"
+            f"🎬 {_fmt(size)} over {_fmt(TELEGRAM_UPLOAD_LIMIT)} — "
+            + (
+                "cutting into timed video clips…"
+                if is_video
+                else f"splitting into ~{_fmt(chunk_limit)} parts…"
+            )
         )
         await _send_split_parts(
             update,
@@ -449,7 +454,7 @@ async def _deliver_file(
             on_progress=on_progress,
             prefix=prefix,
         )
-        await status.edit_text(f"{prefix}Done ✅ (split parts)")
+        await status.edit_text(f"{prefix}Done ✅ (split)")
         return
 
     await on_progress("📤 Uploading to Telegram chat…")
@@ -468,6 +473,198 @@ async def _deliver_file(
     await status.edit_text(f"{prefix}Done ✅")
 
 
+def _fmt_timestamp(seconds: float) -> str:
+    """Format seconds as MM:SS or HH:MM:SS."""
+    total = max(0, int(round(seconds)))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+async def _ffprobe_duration(path: Path) -> float:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"ffprobe failed: {(err or out).decode(errors='replace')[:300]}"
+        )
+    text = out.decode().strip()
+    if not text:
+        raise RuntimeError("ffprobe returned empty duration")
+    return float(text)
+
+
+async def _ffmpeg_cut_segment(
+    src: Path,
+    dest: Path,
+    *,
+    start: float,
+    duration: float,
+    max_bytes: int,
+) -> None:
+    """Cut a playable MP4 segment; re-encode if stream-copy exceeds max_bytes."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    async def _run(args: list[str]) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed: {err.decode(errors='replace')[-400:]}"
+            )
+
+    # Fast path: stream copy (cuts near keyframes).
+    try:
+        await _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(src),
+                "-t",
+                f"{duration:.3f}",
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a:0?",
+                "-c",
+                "copy",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-movflags",
+                "+faststart",
+                str(dest),
+            ]
+        )
+        if dest.exists() and 0 < dest.stat().st_size <= max_bytes:
+            return
+    except RuntimeError as exc:
+        logger.info("Stream-copy cut failed, re-encoding: %s", exc)
+
+    # Re-encode to fit size budget / fix incompatible containers.
+    dest.unlink(missing_ok=True)
+    # Target ~85% of limit; leave headroom for container overhead.
+    target_bits = max(100_000, int(max_bytes * 8 * 0.85 / max(duration, 1.0)))
+    audio_bits = 128_000
+    video_bits = max(80_000, target_bits - audio_bits)
+    await _run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(src),
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            str(video_bits),
+            "-maxrate",
+            str(video_bits),
+            "-bufsize",
+            str(video_bits * 2),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ]
+    )
+    if not dest.exists() or dest.stat().st_size == 0:
+        raise RuntimeError("ffmpeg produced empty segment")
+    if dest.stat().st_size > max_bytes:
+        # Last resort: shorter re-encode window handled by caller via smaller duration.
+        raise RuntimeError(
+            f"segment still too large ({dest.stat().st_size} > {max_bytes})"
+        )
+
+
+async def _build_video_segments(
+    path: Path,
+    *,
+    size: int,
+    chunk_limit: int,
+    on_progress,
+) -> list[tuple[Path, float, float]]:
+    """Return list of (segment_path, start_sec, end_sec)."""
+    duration = await _ffprobe_duration(path)
+    if duration <= 0:
+        raise RuntimeError("invalid video duration")
+
+    # Estimate seconds per chunk from average bitrate, with safety margin.
+    bytes_per_sec = size / duration
+    seg_dur = max(20.0, (chunk_limit * 0.80) / bytes_per_sec)
+
+    parts_dir = path.parent / f".vparts_{path.stem}"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    segments: list[tuple[Path, float, float]] = []
+    start = 0.0
+    idx = 1
+
+    while start < duration - 0.25:
+        remaining = duration - start
+        trial = min(seg_dur, remaining)
+        # Shrink until segment fits (handles keyframe / bitrate spikes).
+        fitted = False
+        for _attempt in range(6):
+            end = min(duration, start + trial)
+            out = parts_dir / f"{path.stem}_part{idx:03d}.mp4"
+            await on_progress(
+                f"🎬 Cutting {_fmt_timestamp(start)} – {_fmt_timestamp(end)}…"
+            )
+            try:
+                await _ffmpeg_cut_segment(
+                    path,
+                    out,
+                    start=start,
+                    duration=end - start,
+                    max_bytes=chunk_limit,
+                )
+                segments.append((out, start, end))
+                start = end
+                idx += 1
+                fitted = True
+                break
+            except RuntimeError as exc:
+                logger.warning("Segment cut retry (trial=%.1fs): %s", trial, exc)
+                out.unlink(missing_ok=True)
+                trial = max(12.0, trial * 0.65)
+                if trial >= remaining and _attempt >= 4:
+                    break
+        if not fitted:
+            raise RuntimeError(
+                f"Could not cut a segment under {_fmt(chunk_limit)} "
+                f"starting at {_fmt_timestamp(start)}"
+            )
+
+    return segments
+
+
 async def _send_split_parts(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -480,7 +677,105 @@ async def _send_split_parts(
     on_progress,
     prefix: str = "",
 ) -> None:
-    """Send oversized files as numbered parts (join with: cat name.part* > name)."""
+    """Split oversized media: videos → timed MP4 clips; others → binary parts."""
+    if path.suffix.lower() in VIDEO_EXTS:
+        await _send_video_time_parts(
+            update,
+            context,
+            path=path,
+            title=title,
+            source=source,
+            size=size,
+            chunk_limit=chunk_limit,
+            on_progress=on_progress,
+            prefix=prefix,
+        )
+        return
+
+    await _send_binary_parts(
+        update,
+        context,
+        path=path,
+        title=title,
+        source=source,
+        size=size,
+        chunk_limit=chunk_limit,
+        on_progress=on_progress,
+        prefix=prefix,
+    )
+
+
+async def _send_video_time_parts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: Path,
+    title: str,
+    source: str,
+    size: int,
+    chunk_limit: int,
+    on_progress,
+    prefix: str = "",
+) -> None:
+    segments: list[tuple[Path, float, float]] = []
+    try:
+        segments = await _build_video_segments(
+            path, size=size, chunk_limit=chunk_limit, on_progress=on_progress
+        )
+        await update.message.reply_text(
+            f"{prefix}🎬 *{_escape_md(title)}* · {_fmt(size)}\n"
+            f"Sending *{len(segments)}* video clips · `{source}`",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+        for i, (part, start, end) in enumerate(segments, start=1):
+            caption = f"{_fmt_timestamp(start)} - {_fmt_timestamp(end)}"
+            await on_progress(
+                f"📤 Uploading clip {i}/{len(segments)} ({caption})…"
+            )
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action=ChatAction.UPLOAD_VIDEO,
+            )
+            try:
+                await update.message.reply_video(
+                    video=part,
+                    caption=caption,
+                    supports_streaming=True,
+                    filename=part.name,
+                )
+            except TelegramError:
+                await update.message.reply_document(
+                    document=part,
+                    filename=part.name,
+                    caption=caption,
+                )
+    finally:
+        for part, _s, _e in segments:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if segments:
+            try:
+                segments[0][0].parent.rmdir()
+            except OSError:
+                pass
+
+
+async def _send_binary_parts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: Path,
+    title: str,
+    source: str,
+    size: int,
+    chunk_limit: int,
+    on_progress,
+    prefix: str = "",
+) -> None:
+    """Fallback for non-video oversized files."""
     parts_dir = path.parent / f".parts_{path.stem}"
     parts_dir.mkdir(parents=True, exist_ok=True)
     part_paths: list[Path] = []
@@ -507,8 +802,7 @@ async def _send_split_parts(
             f"{prefix}📦 *{_escape_md(title)}* is {_fmt(size)} "
             f"(over {_fmt(TELEGRAM_UPLOAD_LIMIT)}).\n"
             f"Sending *{len(part_paths)}* parts · `{source}`\n\n"
-            f"Join on phone/PC:\n"
-            f"`cat {path.name}.part* > {path.name}`",
+            f"Join:\n`cat {path.name}.part* > {path.name}`",
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True,
         )
