@@ -69,9 +69,9 @@ def _unique_urls(urls: list[str]) -> list[str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     aria = "ok" if aria2_available() else "MISSING (install aria2)"
     local = (
-        f"ON — uploads up to {MAX_FILE_SIZE_MB} MB"
+        f"ON — uploads up to {MAX_FILE_SIZE_MB} MB as one file"
         if LOCAL_MODE
-        else "OFF — 50 MB upload cap (need local Bot API for 2 GB)"
+        else "OFF — files over 50 MB are split into parts"
     )
     active, waiting, maximum = await queue_stats()
     await update.message.reply_text(
@@ -430,14 +430,26 @@ async def _deliver_file(
     on_progress,
     prefix: str = "",
 ) -> None:
+    # Stay under Bot API limit with a small safety margin (multipart overhead).
+    chunk_limit = max(1_000_000, TELEGRAM_UPLOAD_LIMIT - (2 * 1024 * 1024))
+
     if size > TELEGRAM_UPLOAD_LIMIT:
-        await status.edit_text(
-            f"{prefix}❌ File is {_fmt(size)} — over send limit "
-            f"{_fmt(TELEGRAM_UPLOAD_LIMIT)}.\n"
-            "Start local Bot API (docker compose / ./start_local_api.sh) "
-            "with api_id + api_hash for up to 2 GB.\n"
-            "Temp file deleted — nothing kept on server."
+        await on_progress(
+            f"📦 {_fmt(size)} over {_fmt(TELEGRAM_UPLOAD_LIMIT)} limit — "
+            f"splitting into ~{_fmt(chunk_limit)} parts…"
         )
+        await _send_split_parts(
+            update,
+            context,
+            path=path,
+            title=title,
+            source=source,
+            size=size,
+            chunk_limit=chunk_limit,
+            on_progress=on_progress,
+            prefix=prefix,
+        )
+        await status.edit_text(f"{prefix}Done ✅ (split parts)")
         return
 
     await on_progress("📤 Uploading to Telegram chat…")
@@ -454,6 +466,86 @@ async def _deliver_file(
         ),
     )
     await status.edit_text(f"{prefix}Done ✅")
+
+
+async def _send_split_parts(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    path: Path,
+    title: str,
+    source: str,
+    size: int,
+    chunk_limit: int,
+    on_progress,
+    prefix: str = "",
+) -> None:
+    """Send oversized files as numbered parts (join with: cat name.part* > name)."""
+    parts_dir = path.parent / f".parts_{path.stem}"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    part_paths: list[Path] = []
+    try:
+        total_parts = (size + chunk_limit - 1) // chunk_limit
+        with path.open("rb") as src:
+            for idx in range(1, total_parts + 1):
+                part_name = f"{path.name}.part{idx:03d}"
+                part_path = parts_dir / part_name
+                remaining = chunk_limit
+                with part_path.open("wb") as dst:
+                    while remaining > 0:
+                        block = src.read(min(1024 * 1024, remaining))
+                        if not block:
+                            break
+                        dst.write(block)
+                        remaining -= len(block)
+                if part_path.stat().st_size == 0:
+                    part_path.unlink(missing_ok=True)
+                    break
+                part_paths.append(part_path)
+
+        await update.message.reply_text(
+            f"{prefix}📦 *{_escape_md(title)}* is {_fmt(size)} "
+            f"(over {_fmt(TELEGRAM_UPLOAD_LIMIT)}).\n"
+            f"Sending *{len(part_paths)}* parts · `{source}`\n\n"
+            f"Join on phone/PC:\n"
+            f"`cat {path.name}.part* > {path.name}`",
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
+
+        for i, part in enumerate(part_paths, start=1):
+            await on_progress(f"📤 Uploading part {i}/{len(part_paths)}…")
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action=ChatAction.UPLOAD_DOCUMENT,
+            )
+            caption = (
+                f"Part {i}/{len(part_paths)} · {_escape_md(title)}\n"
+                f"`{part.name}` · {_fmt(part.stat().st_size)}"
+            )
+            try:
+                await update.message.reply_document(
+                    document=part,
+                    filename=part.name,
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except TelegramError:
+                await update.message.reply_document(
+                    document=part,
+                    filename=part.name,
+                    caption=caption.replace("`", "").replace("*", ""),
+                )
+    finally:
+        for part in part_paths:
+            try:
+                part.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            parts_dir.rmdir()
+        except OSError:
+            pass
 
 
 def _media_input(path: Path):

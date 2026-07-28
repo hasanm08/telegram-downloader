@@ -116,6 +116,22 @@ def _friendly_http_error(exc: BaseException, url: str) -> str:
     return text
 
 
+_HTML_MARKERS = (
+    b"<!DOCTYPE html",
+    b"<!doctype html",
+    b"<html",
+    b"<head",
+)
+
+
+def _looks_like_html(chunk: bytes, content_type: str) -> bool:
+    ctype = (content_type or "").split(";")[0].strip().lower()
+    if ctype in {"text/html", "application/xhtml+xml"}:
+        return True
+    sample = chunk.lstrip()[:64].lower()
+    return any(sample.startswith(m) for m in _HTML_MARKERS)
+
+
 async def download_direct(
     url: str,
     on_progress: Optional[ProgressCallback] = None,
@@ -129,6 +145,7 @@ async def download_direct(
                 if resp.status == 403:
                     raise PermissionError(_friendly_http_error(Exception("403"), url))
                 resp.raise_for_status()
+                ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
                 total = int(resp.headers.get("Content-Length") or 0)
                 if total and total > MAX_FILE_SIZE_BYTES:
                     raise ValueError(
@@ -140,17 +157,31 @@ async def download_direct(
                 filename = _filename_from_cd(cd)
                 if not filename:
                     path_name = Path(unquote(urlparse(str(resp.url)).path)).name
-                    filename = path_name if path_name and "." in path_name else "download.bin"
+                    filename = path_name if path_name and "." in path_name else "download"
                 if "." not in filename:
-                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-                    filename = f"{filename}{mimetypes.guess_extension(ctype) or '.bin'}"
+                    ext = mimetypes.guess_extension(ctype) or ".bin"
+                    # Prefer real media extensions; never invent .bin for HTML pages.
+                    if ctype.lower() in {"text/html", "application/xhtml+xml"}:
+                        ext = ".html"
+                    filename = f"{filename}{ext}"
 
                 filename = _safe_filename(filename)
                 out_path = _unique_path(TEMP_DIR / filename)
                 downloaded = 0
                 last_report = 0
+                first_chunk: Optional[bytes] = None
                 async with aiofiles.open(out_path, "wb") as f:
                     async for chunk in resp.content.iter_chunked(1024 * 256):
+                        if first_chunk is None:
+                            first_chunk = chunk
+                            if _looks_like_html(chunk, ctype):
+                                out_path.unlink(missing_ok=True)
+                                raise RuntimeError(
+                                    "Got an HTML player/page instead of media. "
+                                    "This URL needs stream extraction (yt-dlp), "
+                                    "not a direct file download.\n"
+                                    f"URL: {url[:200]}"
+                                )
                         await f.write(chunk)
                         downloaded += len(chunk)
                         if downloaded > MAX_FILE_SIZE_BYTES:
@@ -255,17 +286,94 @@ async def download_stream(
     return await loop.run_in_executor(None, _run)
 
 
+def _hex_reverse_decode(encoded: str) -> str:
+    clean = encoded.replace("|", "")
+    out = "".join(chr(int(clean[i : i + 2], 16)) for i in range(0, len(clean), 2))
+    return out[::-1]
+
+
+def extract_media_url_from_html(html: str) -> Optional[str]:
+    """Pull a real media URL out of an embed/player HTML page when possible."""
+    m = re.search(r"_0x1\s*=\s*[\"']([^\"']+)[\"']", html)
+    if m:
+        try:
+            decoded = _hex_reverse_decode(m.group(1))
+            if decoded.startswith("http") and any(
+                x in decoded for x in (".m3u8", ".mp4", ".mpd")
+            ):
+                return decoded
+        except (ValueError, IndexError):
+            pass
+
+    for pat in (
+        r"""["'](https?://[^"']+\.m3u8[^"']*)["']""",
+        r"""["'](https?://[^"']+\.mp4[^"']*)["']""",
+        r"""["'](https?://[^"']+\.mpd[^"']*)["']""",
+    ):
+        m = re.search(pat, html, re.I)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _resolve_player_page(
+    url: str,
+    on_progress: Optional[ProgressCallback] = None,
+) -> Optional[str]:
+    """If url is an HTML player page, return the embedded media URL."""
+    timeout = aiohttp.ClientTimeout(total=45, sock_connect=20, sock_read=30)
+    headers = _http_headers(url, referer=url)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if resp.status >= 400:
+                    return None
+                # Only sniff pages — skip obvious binary downloads.
+                if "text/html" not in ctype and "application/xhtml" not in ctype:
+                    # Still peek at small responses that claim octet-stream.
+                    if "octet-stream" not in ctype and "text/" not in ctype:
+                        return None
+                raw = await resp.content.read(512 * 1024)
+                if not _looks_like_html(raw, ctype):
+                    return None
+                media = extract_media_url_from_html(raw.decode("utf-8", "ignore"))
+                if media and on_progress:
+                    await on_progress("🎬 Found stream inside player page…")
+                return media
+    except Exception as exc:
+        logger.info("player page resolve failed for %s: %s", url, exc)
+        return None
+
+
+_PLAYER_HINT_RE = re.compile(
+    r"(vidsonic|/e/|/embed/|/player/)",
+    re.I,
+)
+
+
 async def download_url(
     url: str,
     on_progress: Optional[ProgressCallback] = None,
     force_direct: bool = False,
 ) -> DownloadResult:
     """Download on the bot server into temp — caller uploads to Telegram then deletes."""
+    page_url = url
+    # Known HTML player/embed hosts: pull real HLS/mp4 before yt-dlp.
+    if (
+        not force_direct
+        and not is_probably_direct_file(url)
+        and _PLAYER_HINT_RE.search(url)
+    ):
+        embedded = await _resolve_player_page(url, on_progress)
+        if embedded:
+            url = embedded
+
     if force_direct or is_probably_direct_file(url):
         if on_progress:
             await on_progress("⬇️ Server downloading file…")
         try:
-            return await download_direct(url, on_progress, referer=url)
+            return await download_direct(url, on_progress, referer=page_url)
         except Exception as exc:
             raise RuntimeError(_friendly_http_error(exc, url)) from exc
 
@@ -274,11 +382,18 @@ async def download_url(
             await on_progress("🔍 Server resolving stream…")
         return await download_stream(url, on_progress)
     except Exception as exc:
-        logger.info("stream download failed (%s); trying direct", exc)
+        logger.info("stream download failed (%s); trying player/direct", exc)
+        if url == page_url and not is_probably_direct_file(page_url):
+            embedded = await _resolve_player_page(page_url, on_progress)
+            if embedded:
+                try:
+                    return await download_stream(embedded, on_progress)
+                except Exception as exc_emb:
+                    logger.info("embedded stream failed (%s)", exc_emb)
         if on_progress:
             await on_progress("⬇️ Stream failed — trying direct download…")
         try:
-            return await download_direct(url, on_progress, referer=url)
+            return await download_direct(url, on_progress, referer=page_url)
         except Exception as exc2:
             # Prefer the clearer 403 message if present
             msg = _friendly_http_error(exc2, url)

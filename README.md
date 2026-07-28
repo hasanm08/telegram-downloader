@@ -23,10 +23,17 @@ Repo → **Settings → Secrets and variables → Actions**:
 | `TELEGRAM_API_ID` | For 2 GB | From [my.telegram.org/apps](https://my.telegram.org/apps) |
 | `TELEGRAM_API_HASH` | For 2 GB | From [my.telegram.org/apps](https://my.telegram.org/apps) |
 
+Without `TELEGRAM_API_ID` + `TELEGRAM_API_HASH`, uploads are capped at **50 MB**. With them, Actions starts a local Bot API and allows up to **2 GB**.
+
+```bash
+# After creating the app at my.telegram.org/apps:
+./setup_2gb.sh <api_id> <api_hash>
+```
+
 ## Start
 
 1. Push to `main` or open **Actions → Telegram Downloader Bot → Run workflow**
-2. Message the bot on Telegram (`/start`)
+2. Message the bot on Telegram (`/start`) — Local Bot API should say **ON**
 
 ## Persistence across Action restarts
 
